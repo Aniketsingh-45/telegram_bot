@@ -134,6 +134,16 @@ def _sync_download(url: str, temp_dir: str) -> Dict[str, Any]:
         'no_warnings': False,
     }
 
+    # Support cookies for bypassing YouTube datacenter bot checks
+    cookies_data = os.getenv("YOUTUBE_COOKIES", "").strip()
+    if cookies_data:
+        cookie_file = os.path.join(temp_dir, "cookies.txt")
+        with open(cookie_file, "w", encoding="utf-8") as cf:
+            cf.write(cookies_data)
+        ydl_opts['cookiefile'] = cookie_file
+    elif os.path.exists("cookies.txt"):
+        ydl_opts['cookiefile'] = "cookies.txt"
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         if not info:
@@ -292,16 +302,26 @@ async def process_video_download(chat_id: int, video_url: str):
             raw_err = str(e).strip()
             clean_err = raw_err.split('\n')[0][:180]
             clean_err = re.sub(r'^(ERROR:\s*(\[[^\]]+\]\s*)?)', '', clean_err).strip()
+
+            if any(k in raw_err for k in ["Sign in to confirm", "player response", "429", "bot"]):
+                tip = (
+                    "💡 <b>YouTube ne datacenter IP block kiya hai (Bot detection).</b>\n\n"
+                    "• <b>Instagram Reels</b>, <b>TikTok</b> ya <b>Twitter</b> videos try karein (ye 100% chalte hain).\n"
+                    "• Ya YouTube ke liye <code>YOUTUBE_COOKIES</code> configure karein."
+                )
+            else:
+                tip = "• Check karein ki link sahi aur publicly accessible hai."
+
             err_text = (
                 "❌ <b>Video download nahi ho paya!</b>\n\n"
                 f"⚠️ <b>Karan:</b> <code>{clean_err}</code>\n\n"
-                "• Check karein ki link sahi aur publicly accessible hai.\n"
-                "• Private ya age-restricted video download nahi ho sakti."
+                f"{tip}"
             )
             if status_msg_id:
                 await edit_message(client, chat_id, status_msg_id, err_text)
             else:
                 await send_message(client, chat_id, err_text)
+
 
 
         except Exception as e:

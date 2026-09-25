@@ -45,7 +45,7 @@ logging.getLogger().addHandler(log_capture)
 
 
 # Configurable environment variables
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "8061236263:AAEn1Kl3ZwA_JV5qc_lPNAo6sRiO-MH5ic0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB Telegram Bot API limit
@@ -127,7 +127,7 @@ def _sync_download(url: str, temp_dir: str) -> Dict[str, Any]:
 
     ydl_opts = {
         # Prioritize pre-muxed MP4 (with audio included) first, then merged streams
-        'format': 'best[ext=mp4]/bestvideo[height<=720]+bestaudio/best',
+        'format': 'b[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/b/best',
         'outtmpl': outtmpl,
         'merge_output_format': 'mp4',
         'postprocessor_args': {
@@ -220,6 +220,7 @@ def _ensure_telegram_audio(input_file: str) -> str:
             'ffmpeg', '-y', '-i', input_file,
             '-c:v', 'copy',
             '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
+            '-movflags', '+faststart',
             output_file
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)

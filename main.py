@@ -372,17 +372,17 @@ async def get_webhook_info():
 
 
 @app.get("/set-webhook")
-async def manual_set_webhook(url: Optional[str] = None):
+async def manual_set_webhook(request: Request, url: Optional[str] = None):
     """
     Manually register or update the webhook.
-    Usage: /set-webhook?url=https://your-domain.onrender.com
+    Usage: /set-webhook or /set-webhook?url=https://your-domain.onrender.com
     """
-    target_url = url or os.getenv("WEBHOOK_URL", "").strip()
-    if not target_url:
-        return {
-            "status": "error",
-            "message": "Please provide query param ?url=https://your-domain or set WEBHOOK_URL environment variable"
-        }
+    # Auto-detect current host URL if not explicitly provided
+    detected_base = str(request.base_url).rstrip("/")
+    if detected_base.startswith("http://") and "localhost" not in detected_base and "127.0.0.1" not in detected_base:
+        detected_base = "https://" + detected_base[7:]
+
+    target_url = url or os.getenv("WEBHOOK_URL", "").strip() or detected_base
     target = f"{target_url.rstrip('/')}/webhook"
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
@@ -390,6 +390,7 @@ async def manual_set_webhook(url: Optional[str] = None):
             return {"status": "success", "target_url": target, "telegram_response": res.json()}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
 
 
 @app.post("/webhook")

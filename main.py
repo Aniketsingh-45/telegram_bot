@@ -300,46 +300,57 @@ async def process_video_download(chat_id: int, video_url: str):
                     await send_message(client, chat_id, warning_text)
                 return
 
+            # Determine if it's an image or video based on extension
+            is_image = file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+
             # Update status message
             if status_msg_id:
+                media_type_str = "Photo" if is_image else "Video"
                 await edit_message(
                     client, chat_id, status_msg_id,
-                    "📤 <b>Download complete! Telegram par video bhej raha hoon...</b>"
+                    f"📤 <b>Download complete! Telegram par {media_type_str} bhej raha hoon...</b>"
                 )
 
-            await send_chat_action(client, chat_id, "upload_video")
+            await send_chat_action(client, chat_id, "upload_photo" if is_image else "upload_video")
 
             # Prepare caption
-            caption = f"🎬 <b>{title[:300]}</b>"
-            if duration:
+            caption = f"📸 <b>{title[:300]}</b>" if is_image else f"🎬 <b>{title[:300]}</b>"
+            if duration and not is_image:
                 mins, secs = divmod(int(duration), 60)
                 caption += f"\n⏱ <i>Duration: {mins:02d}:{secs:02d}</i>"
-            caption += "\n\n🤖 <i>Downloaded via @AniketVideo_bot</i>\n🔊 <i>Agar aawaz na aaye toh video ke speaker icon par tap karein!</i>"
+            caption += "\n\n🤖 <i>Downloaded via @AniketVideo_bot</i>"
+            if not is_image:
+                caption += "\n🔊 <i>Agar aawaz na aaye toh video ke speaker icon par tap karein!</i>"
 
-            # Upload video directly using multipart/form-data
+            # Upload media directly using multipart/form-data
             with open(file_path, "rb") as f:
                 filename = os.path.basename(file_path)
-                files = {
-                    "video": (filename, f, "video/mp4")
-                }
-                data = {
-                    "chat_id": str(chat_id),
-                    "caption": caption,
-                    "parse_mode": "HTML",
-                    "supports_streaming": "true"
-                }
-                if duration:
-                    data["duration"] = str(duration)
-                if video_data.get("width"):
-                    data["width"] = str(video_data["width"])
-                if video_data.get("height"):
-                    data["height"] = str(video_data["height"])
+                
+                if is_image:
+                    files = {"photo": (filename, f, "image/jpeg")}
+                    data = {
+                        "chat_id": str(chat_id),
+                        "caption": caption,
+                        "parse_mode": "HTML"
+                    }
+                    api_endpoint = f"{TELEGRAM_API}/sendPhoto"
+                else:
+                    files = {"video": (filename, f, "video/mp4")}
+                    data = {
+                        "chat_id": str(chat_id),
+                        "caption": caption,
+                        "parse_mode": "HTML",
+                        "supports_streaming": "true"
+                    }
+                    if duration:
+                        data["duration"] = str(duration)
+                    if video_data.get("width"):
+                        data["width"] = str(video_data["width"])
+                    if video_data.get("height"):
+                        data["height"] = str(video_data["height"])
+                    api_endpoint = f"{TELEGRAM_API}/sendVideo"
 
-                upload_resp = await client.post(
-                    f"{TELEGRAM_API}/sendVideo",
-                    data=data,
-                    files=files
-                )
+                upload_resp = await client.post(api_endpoint, data=data, files=files)
 
                 if upload_resp.status_code == 200:
                     logger.info(f"Video sent successfully to chat {chat_id}!")

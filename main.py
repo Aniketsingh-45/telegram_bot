@@ -123,10 +123,13 @@ def _sync_download(url: str, temp_dir: str) -> Dict[str, Any]:
     outtmpl = os.path.join(temp_dir, "video_%(id)s.%(ext)s")
 
     ydl_opts = {
-        # Prioritize 720p and streamable MP4 format
-        'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+        # Prioritize pre-muxed MP4 (with audio included) first, then merged streams
+        'format': 'best[ext=mp4]/bestvideo[height<=720]+bestaudio/best',
         'outtmpl': outtmpl,
         'merge_output_format': 'mp4',
+        'postprocessor_args': {
+            'merger': ['-c:v', 'copy', '-c:a', 'aac']
+        },
         'http_chunk_size': 10485760,  # 10MB chunks
         'concurrent_fragment_downloads': 5,
         'noplaylist': True,
@@ -149,18 +152,33 @@ def _sync_download(url: str, temp_dir: str) -> Dict[str, Any]:
         if not info:
             raise ValueError("No video information could be retrieved.")
 
-        # Find the downloaded file in temp_dir
-        found_files = [
-            os.path.join(temp_dir, f)
-            for f in os.listdir(temp_dir)
-            if not f.endswith(('.part', '.ytdl')) and os.path.isfile(os.path.join(temp_dir, f))
-        ]
+        # Resolve output file accurately
+        target_file = None
+        prep = ydl.prepare_filename(info)
+        base_no_ext = os.path.splitext(prep)[0]
+        for candidate in [f"{base_no_ext}.mp4", prep]:
+            if os.path.isfile(candidate):
+                target_file = candidate
+                break
 
-        if not found_files:
-            raise FileNotFoundError("Video file was not created by yt-dlp.")
-
-        # Pick the largest file in the folder (usually the final merged mp4)
-        target_file = max(found_files, key=os.path.getsize)
+        if not target_file:
+            # Fallback to finding the largest valid .mp4 file in temp_dir
+            mp4_files = [
+                os.path.join(temp_dir, f)
+                for f in os.listdir(temp_dir)
+                if f.endswith('.mp4') and not f.endswith(('.part', '.ytdl')) and os.path.isfile(os.path.join(temp_dir, f))
+            ]
+            if mp4_files:
+                target_file = max(mp4_files, key=os.path.getsize)
+            else:
+                found_files = [
+                    os.path.join(temp_dir, f)
+                    for f in os.listdir(temp_dir)
+                    if not f.endswith(('.part', '.ytdl')) and os.path.isfile(os.path.join(temp_dir, f))
+                ]
+                if not found_files:
+                    raise FileNotFoundError("Video file was not created by yt-dlp.")
+                target_file = max(found_files, key=os.path.getsize)
 
         return {
             "file_path": target_file,

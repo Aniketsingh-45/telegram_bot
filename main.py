@@ -4,7 +4,9 @@ import shutil
 import asyncio
 import tempfile
 import logging
+import collections
 from typing import Optional, Dict, Any
+from contextlib import asynccontextmanager
 
 # pyrefly: ignore [missing-import]
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -14,16 +16,32 @@ from fastapi.responses import HTMLResponse
 import httpx
 import yt_dlp
  
-from contextlib import asynccontextmanager
 # pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
+# In-memory log buffer to inspect recent logs via /logs endpoint
+class MemoryLogHandler(logging.Handler):
+    def __init__(self, maxlen=200):
+        super().__init__()
+        self.logs = collections.deque(maxlen=maxlen)
+
+    def emit(self, record):
+        try:
+            self.logs.append(self.format(record))
+        except Exception:
+            pass
+
+log_capture = MemoryLogHandler()
+log_capture.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+logging.getLogger().addHandler(log_capture)
+
 
 # Configurable environment variables
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "8061236263:AAEn1Kl3ZwA_JV5qc_lPNAo6sRiO-MH5ic0"
@@ -105,24 +123,20 @@ def _sync_download(url: str, temp_dir: str) -> Dict[str, Any]:
     outtmpl = os.path.join(temp_dir, "video_%(id)s.%(ext)s")
 
     ydl_opts = {
-        # Format prioritizing standard resolutions under Telegram's 50MB limit
-        'format': 'bestvideo[filesize_approx<=45M][ext=mp4]+bestaudio[ext=m4a]/bestvideo[filesize_approx<=45M]+bestaudio/best[filesize_approx<=48M]/bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+        # Prioritize 720p and streamable MP4 format
+        'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
         'outtmpl': outtmpl,
         'merge_output_format': 'mp4',
-        'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
         'extractor_args': {
             'youtube': {
-                # Use android client to bypass 403 Forbidden issues on YouTube
-                'player_client': ['android', 'web_safari']
+                'player_client': ['android', 'ios', 'web']
             }
         },
-        'http_chunk_size': 5242880,  # 5MB chunks to bypass progressive download throttle
+        'http_chunk_size': 10485760,  # 10MB chunks
         'concurrent_fragment_downloads': 5,
-        'remote_components': ['ejs:github'],
-        'js_runtimes': {'node': {}},
         'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
+        'quiet': False,
+        'no_warnings': False,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -280,16 +294,20 @@ async def process_video_download(chat_id: int, video_url: str):
 
         except yt_dlp.utils.DownloadError as e:
             logger.error(f"yt-dlp DownloadError: {e}")
+            raw_err = str(e).strip()
+            clean_err = raw_err.split('\n')[0][:180]
+            clean_err = re.sub(r'^(ERROR:\s*(\[[^\]]+\]\s*)?)', '', clean_err).strip()
             err_text = (
                 "❌ <b>Video download nahi ho paya!</b>\n\n"
-                "Kripya check karein ki:\n"
-                "• Link sahi aur publicly accessible hai.\n"
-                "• Video private ya age-restricted toh nahi hai."
+                f"⚠️ <b>Karan:</b> <code>{clean_err}</code>\n\n"
+                "• Check karein ki link sahi aur publicly accessible hai.\n"
+                "• Private ya age-restricted video download nahi ho sakti."
             )
             if status_msg_id:
                 await edit_message(client, chat_id, status_msg_id, err_text)
             else:
                 await send_message(client, chat_id, err_text)
+
 
         except Exception as e:
             logger.error(f"Unexpected error in process_video_download: {e}", exc_info=True)
@@ -390,6 +408,12 @@ async def manual_set_webhook(request: Request, url: Optional[str] = None):
             return {"status": "success", "target_url": target, "telegram_response": res.json()}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+
+@app.get("/logs")
+async def get_recent_logs():
+    """Inspect recent server and download logs in browser."""
+    return {"logs": list(log_capture.logs)}
 
 
 

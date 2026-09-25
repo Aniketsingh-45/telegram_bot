@@ -44,6 +44,7 @@ logging.getLogger().addHandler(log_capture)
 
 
 # Configurable environment variables
+VERSION = "1.0.5"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "8061236263:AAEn1Kl3ZwA_JV5qc_lPNAo6sRiO-MH5ic0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB Telegram Bot API limit
@@ -55,6 +56,7 @@ async def lifespan(app: FastAPI):
     Lifespan manager for FastAPI.
     Automatically sets the Telegram webhook on server startup if WEBHOOK_URL is provided.
     """
+    logger.info(f"=== Server starting up: Telegram Video Downloader Bot v{VERSION} ===")
     webhook_url = os.getenv("WEBHOOK_URL", "").strip()
     if webhook_url:
         target = f"{webhook_url.rstrip('/')}/webhook"
@@ -441,6 +443,12 @@ async def manual_set_webhook(request: Request, url: Optional[str] = None):
             return {"status": "success", "target_url": target, "telegram_response": res.json()}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+
+@app.get("/version")
+async def get_version():
+    """Returns the deployed bot version."""
+    return {"version": VERSION}
 
 
 @app.get("/logs")

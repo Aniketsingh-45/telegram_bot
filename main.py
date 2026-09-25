@@ -127,11 +127,6 @@ def _sync_download(url: str, temp_dir: str) -> Dict[str, Any]:
         'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
         'outtmpl': outtmpl,
         'merge_output_format': 'mp4',
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios', 'web']
-            }
-        },
         'http_chunk_size': 10485760,  # 10MB chunks
         'concurrent_fragment_downloads': 5,
         'noplaylist': True,

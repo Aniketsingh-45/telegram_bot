@@ -1,0 +1,22 @@
+# Environment variables (Keep your Telegram Bot Token secret!)
+.env
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary downloads or media
+tg_video_*
+*.mp4
+*.part
+*.ytdl
+
+# IDE settings
+.vscode/
+.idea/

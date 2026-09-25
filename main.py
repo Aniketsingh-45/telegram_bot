@@ -5,6 +5,7 @@ import asyncio
 import tempfile
 import logging
 import collections
+import subprocess
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -44,7 +45,7 @@ logging.getLogger().addHandler(log_capture)
 
 
 # Configurable environment variables
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "8061236263:AAEn1Kl3ZwA_JV5qc_lPNAo6sRiO-MH5ic0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB Telegram Bot API limit
@@ -182,15 +183,56 @@ def _sync_download(url: str, temp_dir: str) -> Dict[str, Any]:
                     raise FileNotFoundError("Video file was not created by yt-dlp.")
                 target_file = max(found_files, key=os.path.getsize)
 
+        # Guarantee audio is standardized to AAC-LC for 100% Telegram audio compatibility
+        final_file = _ensure_telegram_audio(target_file)
+
         return {
-            "file_path": target_file,
+            "file_path": final_file,
             "title": info.get("title", "Video"),
             "duration": info.get("duration", 0),
             "width": info.get("width"),
             "height": info.get("height"),
-            "file_size": os.path.getsize(target_file),
+            "file_size": os.path.getsize(final_file),
             "webpage_url": info.get("webpage_url", url)
         }
+
+
+def _ensure_telegram_audio(input_file: str) -> str:
+    """
+    Ensures video audio is converted to standard AAC-LC so Telegram players
+    on Android, iOS, Desktop, and Web can play it with crystal clear audio.
+    """
+    try:
+        probe = subprocess.run([
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'stream=codec_type',
+            '-select_streams', 'a',
+            '-of', 'csv=p=0',
+            input_file
+        ], capture_output=True, text=True)
+
+        if 'audio' not in probe.stdout:
+            logger.info("Source video has no audio stream to convert.")
+            return input_file
+
+        output_file = os.path.splitext(input_file)[0] + "_playable.mp4"
+        cmd = [
+            'ffmpeg', '-y', '-i', input_file,
+            '-c:v', 'copy',
+            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
+            output_file
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0 and os.path.isfile(output_file) and os.path.getsize(output_file) > 0:
+            logger.info(f"Re-encoded audio to standard AAC-LC: {output_file}")
+            return output_file
+        else:
+            logger.warning(f"FFmpeg audio conversion fallback to original: {res.stderr}")
+            return input_file
+    except Exception as e:
+        logger.warning(f"Error checking/converting audio: {e}")
+        return input_file
+
 
 
 async def action_ticker(client: httpx.AsyncClient, chat_id: int, action: str, stop_ev: asyncio.Event):
@@ -271,7 +313,7 @@ async def process_video_download(chat_id: int, video_url: str):
             if duration:
                 mins, secs = divmod(int(duration), 60)
                 caption += f"\n⏱ <i>Duration: {mins:02d}:{secs:02d}</i>"
-            caption += "\n\n🤖 <i>Downloaded via @AniketVideo_bot</i>"
+            caption += "\n\n🤖 <i>Downloaded via @AniketVideo_bot</i>\n🔊 <i>Agar aawaz na aaye toh video ke speaker icon par tap karein!</i>"
 
             # Upload video directly using multipart/form-data
             with open(file_path, "rb") as f:

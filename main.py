@@ -45,7 +45,7 @@ logging.getLogger().addHandler(log_capture)
 
 
 # Configurable environment variables
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "8061236263:AAEn1Kl3ZwA_JV5qc_lPNAo6sRiO-MH5ic0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB Telegram Bot API limit
@@ -210,7 +210,6 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
         'extractor_args': {
             'youtube': {
                 'player_client': ['ios', 'android', 'web'],
-                'player_skip': ['webpage', 'configs'],
             }
         },
     }

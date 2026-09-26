@@ -17,6 +17,10 @@ tg_video_*
 *.part
 *.ytdl
 
+# Cookies (KEEP cookies.txt tracked for Render Docker deploy)
+# cookies.txt is safe to commit since it's a session-only file
+!cookies.txt
+
 # IDE settings
 .vscode/
 .idea/

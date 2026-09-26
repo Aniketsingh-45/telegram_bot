@@ -45,7 +45,7 @@ logging.getLogger().addHandler(log_capture)
 
 
 # Configurable environment variables
-VERSION = "1.0.8"
+VERSION = "1.0.9"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "8061236263:AAEn1Kl3ZwA_JV5qc_lPNAo6sRiO-MH5ic0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB Telegram Bot API limit
@@ -211,11 +211,15 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
     # Support cookies for bypassing YouTube datacenter bot checks
     cookies_data = os.getenv("YOUTUBE_COOKIES", "").strip()
     if cookies_data:
+        # Render stores multiline env vars with literal \n — fix to real newlines
+        cookies_data = cookies_data.replace("\\n", "\n")
         cookie_file = os.path.join(temp_dir, "cookies.txt")
-        with open(cookie_file, "w", encoding="utf-8") as cf:
+        with open(cookie_file, "w", encoding="utf-8", newline="\n") as cf:
             cf.write(cookies_data)
+        logger.info(f"Loaded YOUTUBE_COOKIES from env ({len(cookies_data)} chars, {cookies_data.count(chr(10))} lines)")
         ydl_opts['cookiefile'] = cookie_file
     elif os.path.exists("cookies.txt"):
+        logger.info("Loaded cookies from local cookies.txt file")
         ydl_opts['cookiefile'] = "cookies.txt"
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:

@@ -467,6 +467,11 @@ async def process_video_download(chat_id: int, video_url: str, quality: Optional
             if not is_image:
                 caption += "\n🔊 <i>Agar aawaz na aaye toh video ke speaker icon par tap karein!</i>"
 
+            # Bypass Telegram Deduplication Cache by appending a random byte
+            with open(file_path, "ab") as f:
+                import random
+                f.write(bytes([random.randint(0, 255)]))
+
             # Upload media directly using multipart/form-data
             with open(file_path, "rb") as f:
                 filename = os.path.basename(file_path)

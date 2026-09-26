@@ -45,10 +45,13 @@ logging.getLogger().addHandler(log_capture)
 
 
 # Configurable environment variables
-VERSION = "1.0.7"
+VERSION = "1.0.8"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "8061236263:AAEn1Kl3ZwA_JV5qc_lPNAo6sRiO-MH5ic0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB Telegram Bot API limit
+
+# In-memory store: chat_id -> {url, message_id} waiting for quality selection
+pending_downloads: Dict[int, Dict[str, Any]] = {}
 
 
 @asynccontextmanager
@@ -78,6 +81,60 @@ app = FastAPI(title="Telegram Video Downloader Bot", lifespan=lifespan)
 
 # URL extraction pattern
 URL_REGEX = re.compile(r'https?://[^\s<>"]+')
+
+
+def is_youtube_video(url: str) -> bool:
+    """Returns True if URL is a YouTube long-form video (not Shorts)."""
+    yt_patterns = [
+        r'(?:youtube\.com/watch\?.*v=|youtu\.be/)[A-Za-z0-9_-]{11}',
+    ]
+    shorts_patterns = [
+        r'youtube\.com/shorts/',
+        r'youtu\.be/shorts/',
+    ]
+    url_lower = url.lower()
+    if any(re.search(p, url_lower) for p in shorts_patterns):
+        return False
+    return any(re.search(p, url) for p in yt_patterns)
+
+
+async def send_quality_keyboard(client: httpx.AsyncClient, chat_id: int, video_url: str) -> Optional[int]:
+    """Sends an inline keyboard asking user to choose video quality."""
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "🎯 360p", "callback_data": "q_360"},
+                {"text": "📺 480p", "callback_data": "q_480"},
+            ],
+            [
+                {"text": "🔥 720p (HD)", "callback_data": "q_720"},
+                {"text": "💎 1080p (FHD)", "callback_data": "q_1080"},
+            ],
+        ]
+    }
+    try:
+        resp = await client.post(f"{TELEGRAM_API}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": "🎬 <b>YouTube Video mila!</b>\n\nKaunsi <b>quality</b> mein download karein?",
+            "parse_mode": "HTML",
+            "reply_markup": keyboard
+        })
+        result = resp.json().get("result", {})
+        return result.get("message_id")
+    except Exception as e:
+        logger.error(f"Error sending quality keyboard: {e}")
+        return None
+
+
+async def answer_callback_query(client: httpx.AsyncClient, callback_query_id: str, text: str = ""):
+    """Acknowledge a callback query to remove the loading spinner."""
+    try:
+        await client.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
+            "callback_query_id": callback_query_id,
+            "text": text
+        })
+    except Exception as e:
+        logger.warning(f"Error answering callback: {e}")
 
 
 async def send_chat_action(client: httpx.AsyncClient, chat_id: int, action: str = "upload_video"):
@@ -118,16 +175,27 @@ async def edit_message(client: httpx.AsyncClient, chat_id: int, message_id: int,
         logger.warning(f"Error editing message {message_id}: {e}")
 
 
-def _sync_download(url: str, temp_dir: str) -> Dict[str, Any]:
+def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Dict[str, Any]:
     """
     Synchronous worker running yt-dlp download in a background thread.
     Returns metadata dict with filepath, title, duration, and file size.
+    quality: '360', '480', '720', '1080' for YouTube; None = auto-best
     """
     outtmpl = os.path.join(temp_dir, "video_%(id)s.%(ext)s")
 
+    # Build format string based on requested quality
+    if quality:
+        h = quality  # e.g. '720'
+        fmt = (
+            f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={h}]+bestaudio/"
+            f"best[height<={h}]/best"
+        )
+    else:
+        fmt = 'b[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/b/best'
+
     ydl_opts = {
-        # Prioritize pre-muxed MP4 (with audio included) first, then merged streams
-        'format': 'b[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/b/best',
+        'format': fmt,
         'outtmpl': outtmpl,
         'merge_output_format': 'mp4',
         'postprocessor_args': {
@@ -246,9 +314,10 @@ async def action_ticker(client: httpx.AsyncClient, chat_id: int, action: str, st
             pass
 
 
-async def process_video_download(chat_id: int, video_url: str):
+async def process_video_download(chat_id: int, video_url: str, quality: Optional[str] = None):
     """
     Background worker that handles downloading the video and sending it to Telegram.
+    quality: '360', '480', '720', '1080' for YouTube; None = auto-best
     Runs asynchronously without blocking webhook responses.
     """
     temp_dir = tempfile.mkdtemp(prefix="tg_video_")
@@ -275,8 +344,11 @@ async def process_video_download(chat_id: int, video_url: str):
                 )
 
             # Download video in thread pool to prevent blocking asyncio loop
-            logger.info(f"Downloading video from {video_url} for chat {chat_id}...")
-            video_data = await asyncio.to_thread(_sync_download, video_url, temp_dir)
+            quality_label = f" ({quality}p)" if quality else ""
+            logger.info(f"Downloading video{quality_label} from {video_url} for chat {chat_id}...")
+            if quality:
+                await edit_message(client, chat_id, status_msg_id, f"⬇️ <b>{quality}p mein download ho raha hai...</b>")
+            video_data = await asyncio.to_thread(_sync_download, video_url, temp_dir, quality)
 
             file_path = video_data["file_path"]
             file_size = video_data["file_size"]
@@ -563,8 +635,15 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         match = URL_REGEX.search(text)
         if match:
             video_url = match.group(0)
-            # Add video processing to background tasks
-            background_tasks.add_task(process_video_download, chat_id, video_url)
+            if is_youtube_video(video_url):
+                # Ask for quality first via inline keyboard
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    msg_id = await send_quality_keyboard(client, chat_id, video_url)
+                # Store pending download until user picks quality
+                pending_downloads[chat_id] = {"url": video_url, "message_id": msg_id}
+            else:
+                # Shorts, Reels, Posts → direct download, no quality prompt
+                background_tasks.add_task(process_video_download, chat_id, video_url)
         else:
             invalid_text = (
                 "❌ <b>Koi valid link nahi mila!</b>\n\n"
@@ -572,6 +651,40 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             )
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await send_message(client, chat_id, invalid_text)
+
+    elif "callback_query" in data:
+        # Handle quality button press
+        cq = data["callback_query"]
+        cq_id = cq.get("id")
+        cq_data = cq.get("data", "")
+        cq_chat_id = cq.get("message", {}).get("chat", {}).get("id")
+        cq_msg_id = cq.get("message", {}).get("message_id")
+
+        if cq_data.startswith("q_") and cq_chat_id:
+            quality_map = {"q_360": "360", "q_480": "480", "q_720": "720", "q_1080": "1080"}
+            chosen_quality = quality_map.get(cq_data)
+            pending = pending_downloads.pop(cq_chat_id, None)
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # Acknowledge the button press
+                await answer_callback_query(client, cq_id, f"✅ {chosen_quality}p selected!")
+                # Delete the quality-selection message
+                if cq_msg_id:
+                    try:
+                        await client.post(f"{TELEGRAM_API}/deleteMessage", json={
+                            "chat_id": cq_chat_id,
+                            "message_id": cq_msg_id
+                        })
+                    except Exception:
+                        pass
+
+            if pending and chosen_quality:
+                background_tasks.add_task(
+                    process_video_download, cq_chat_id, pending["url"], chosen_quality
+                )
+            else:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await send_message(client, cq_chat_id, "❌ <b>Session expire ho gaya, dobara link bhejein.</b>")
 
     return {"status": "ok"}
 

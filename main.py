@@ -183,8 +183,13 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
     """
     outtmpl = os.path.join(temp_dir, "video_%(id)s.%(ext)s")
 
+    is_ig_fb = 'instagram.com' in url or 'facebook.com' in url or 'fb.watch' in url
+
     # Build format string based on requested quality
-    if quality:
+    if is_ig_fb:
+        # Instagram/Facebook reels and images are best fetched as single pre-merged files
+        fmt = 'best'
+    elif quality:
         h = quality  # e.g. '720'
         fmt = (
             f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
@@ -197,10 +202,6 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
     ydl_opts = {
         'format': fmt,
         'outtmpl': outtmpl,
-        'merge_output_format': 'mp4',
-        'postprocessor_args': {
-            'merger': ['-c:v', 'copy', '-c:a', 'aac']
-        },
         'http_chunk_size': 10485760,  # 10MB chunks
         'concurrent_fragment_downloads': 5,
         'noplaylist': True,
@@ -213,6 +214,12 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
             }
         },
     }
+
+    if not is_ig_fb:
+        ydl_opts['merge_output_format'] = 'mp4'
+        ydl_opts['postprocessor_args'] = {
+            'merger': ['-c:v', 'copy', '-c:a', 'aac']
+        }
 
     # Support cookies for bypassing YouTube datacenter bot checks
     # Check multiple possible paths for cookie file

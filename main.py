@@ -6,6 +6,8 @@ import tempfile
 import logging
 import collections
 import subprocess
+import uuid
+import html
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -175,6 +177,44 @@ async def edit_message(client: httpx.AsyncClient, chat_id: int, message_id: int,
         logger.warning(f"Error editing message {message_id}: {e}")
 
 
+def _download_instagram_image_fallback(url: str, temp_dir: str) -> Dict[str, Any]:
+    try:
+        res = httpx.get(url, timeout=15.0)
+        # Extract og:image
+        m_img = re.search(r'<meta property="og:image" content="([^"]+)"', res.text)
+        if not m_img:
+            raise ValueError("No og:image found in Instagram fallback.")
+        
+        img_url = html.unescape(m_img.group(1))
+        
+        # Extract title/description
+        title = "Instagram Post"
+        m_title = re.search(r'<meta property="og:description" content="([^"]+)"', res.text)
+        if m_title:
+            title = html.unescape(m_title.group(1))
+            
+        # Download image
+        img_res = httpx.get(img_url, timeout=15.0)
+        img_res.raise_for_status()
+        
+        file_path = os.path.join(temp_dir, f"insta_fallback_{uuid.uuid4().hex[:8]}.jpg")
+        with open(file_path, "wb") as f:
+            f.write(img_res.content)
+            
+        return {
+            "file_path": file_path,
+            "title": title[:300],
+            "duration": None,
+            "width": None,
+            "height": None,
+            "file_size": os.path.getsize(file_path),
+            "webpage_url": url
+        }
+    except Exception as e:
+        logger.error(f"Instagram fallback failed: {e}")
+        raise ValueError(f"Failed to download Instagram post: {e}")
+
+
 def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Dict[str, Any]:
     """
     Synchronous worker running yt-dlp download in a background thread.
@@ -250,51 +290,58 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
         else:
             logger.info("No cookies found — using mobile player client fallback for YouTube")
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if not info:
-            raise ValueError("No video information could be retrieved.")
-
-        # Resolve output file accurately
-        target_file = None
-        prep = ydl.prepare_filename(info)
-        base_no_ext = os.path.splitext(prep)[0]
-        for candidate in [f"{base_no_ext}.mp4", prep]:
-            if os.path.isfile(candidate):
-                target_file = candidate
-                break
-
-        if not target_file:
-            # Fallback to finding the largest valid .mp4 file in temp_dir
-            mp4_files = [
-                os.path.join(temp_dir, f)
-                for f in os.listdir(temp_dir)
-                if f.endswith('.mp4') and not f.endswith(('.part', '.ytdl')) and os.path.isfile(os.path.join(temp_dir, f))
-            ]
-            if mp4_files:
-                target_file = max(mp4_files, key=os.path.getsize)
-            else:
-                found_files = [
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                raise ValueError("No video information could be retrieved.")
+            
+            # Resolve output file accurately
+            target_file = None
+            prep = ydl.prepare_filename(info)
+            base_no_ext = os.path.splitext(prep)[0]
+            for candidate in [f"{base_no_ext}.mp4", prep]:
+                if os.path.isfile(candidate):
+                    target_file = candidate
+                    break
+                    
+            if not target_file:
+                # Fallback to finding the largest valid .mp4 file in temp_dir
+                mp4_files = [
                     os.path.join(temp_dir, f)
                     for f in os.listdir(temp_dir)
-                    if not f.endswith(('.part', '.ytdl')) and os.path.isfile(os.path.join(temp_dir, f))
+                    if f.endswith('.mp4') and not f.endswith(('.part', '.ytdl')) and os.path.isfile(os.path.join(temp_dir, f))
                 ]
-                if not found_files:
-                    raise FileNotFoundError("Video file was not created by yt-dlp.")
-                target_file = max(found_files, key=os.path.getsize)
+                if mp4_files:
+                    target_file = max(mp4_files, key=os.path.getsize)
+                else:
+                    found_files = [
+                        os.path.join(temp_dir, f)
+                        for f in os.listdir(temp_dir)
+                        if not f.endswith(('.part', '.ytdl')) and os.path.isfile(os.path.join(temp_dir, f))
+                    ]
+                    if not found_files:
+                        raise FileNotFoundError("Video file was not created by yt-dlp.")
+                    target_file = max(found_files, key=os.path.getsize)
 
-        # Guarantee audio is standardized to AAC-LC for 100% Telegram audio compatibility
-        final_file = _ensure_telegram_audio(target_file)
+            # Guarantee audio is standardized to AAC-LC for 100% Telegram audio compatibility
+            final_file = _ensure_telegram_audio(target_file)
 
-        return {
-            "file_path": final_file,
-            "title": info.get("title", "Video"),
-            "duration": info.get("duration", 0),
-            "width": info.get("width"),
-            "height": info.get("height"),
-            "file_size": os.path.getsize(final_file),
-            "webpage_url": info.get("webpage_url", url)
-        }
+            return {
+                "file_path": final_file,
+                "title": info.get("title", "Video"),
+                "duration": info.get("duration", 0),
+                "width": info.get("width"),
+                "height": info.get("height"),
+                "file_size": os.path.getsize(final_file),
+                "webpage_url": info.get("webpage_url", url)
+            }
+    except Exception as e:
+        err_msg = str(e).lower()
+        if is_ig_fb and ("there is no video" in err_msg or "empty media response" in err_msg or "not granting access" in err_msg):
+            logger.info("yt-dlp failed for Instagram post, attempting fallback image extraction...")
+            return _download_instagram_image_fallback(url, temp_dir)
+        raise e
 
 
 def _ensure_telegram_audio(input_file: str) -> str:

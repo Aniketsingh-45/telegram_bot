@@ -45,7 +45,7 @@ logging.getLogger().addHandler(log_capture)
 
 
 # Configurable environment variables
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "8061236263:AAEn1Kl3ZwA_JV5qc_lPNAo6sRiO-MH5ic0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB Telegram Bot API limit
@@ -206,29 +206,43 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
         'noplaylist': True,
         'quiet': False,
         'no_warnings': False,
+        # Use mobile player clients to bypass YouTube datacenter bot detection
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android', 'web'],
+                'player_skip': ['webpage', 'configs'],
+            }
+        },
     }
 
     # Support cookies for bypassing YouTube datacenter bot checks
-    # Priority 1: Render Secret File (avoids "argument list too long" build error)
-    render_cookie_file = "/etc/secrets/cookies.txt"
-    if os.path.exists(render_cookie_file):
-        logger.info(f"Loaded cookies from Render Secret File: {render_cookie_file}")
-        ydl_opts['cookiefile'] = render_cookie_file
+    # Check multiple possible paths for cookie file
+    cookie_paths = [
+        "/etc/secrets/cookies.txt",   # Render Secret File
+        "/app/cookies.txt",            # Docker container root
+        "cookies.txt",                 # Local dev
+    ]
+    cookie_file_found = None
+    for cp in cookie_paths:
+        if os.path.exists(cp):
+            cookie_file_found = cp
+            break
+
+    if cookie_file_found:
+        logger.info(f"Loaded cookies from file: {cookie_file_found}")
+        ydl_opts['cookiefile'] = cookie_file_found
     else:
-        # Priority 2: YOUTUBE_COOKIES env var (small envs / local dev)
+        # Fallback: YOUTUBE_COOKIES env var
         cookies_data = os.getenv("YOUTUBE_COOKIES", "").strip()
         if cookies_data:
-            # Render sometimes stores multiline env vars with literal \n
             cookies_data = cookies_data.replace("\\n", "\n")
             cookie_file = os.path.join(temp_dir, "cookies.txt")
             with open(cookie_file, "w", encoding="utf-8", newline="\n") as cf:
                 cf.write(cookies_data)
-            logger.info(f"Loaded YOUTUBE_COOKIES from env ({len(cookies_data)} chars, {cookies_data.count(chr(10))} lines)")
+            logger.info(f"Loaded YOUTUBE_COOKIES from env ({len(cookies_data)} chars)")
             ydl_opts['cookiefile'] = cookie_file
-        # Priority 3: Local cookies.txt file
-        elif os.path.exists("cookies.txt"):
-            logger.info("Loaded cookies from local cookies.txt file")
-            ydl_opts['cookiefile'] = "cookies.txt"
+        else:
+            logger.info("No cookies found — using mobile player client fallback for YouTube")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)

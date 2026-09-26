@@ -206,10 +206,10 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
         'noplaylist': True,
         'quiet': False,
         'no_warnings': False,
-        # Use mobile player clients to bypass YouTube datacenter bot detection
+        # Use mobile player clients to bypass YouTube datacenter bot detection (avoid 'web')
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'android', 'web'],
+                'player_client': ['android', 'ios'],
             }
         },
     }

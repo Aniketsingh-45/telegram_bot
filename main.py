@@ -422,8 +422,9 @@ def _scrape_instagram_media(url: str, temp_dir: str) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.warning(f"Failed to download scraped video {i}: {e}")
 
-    # ---- Download images if no videos ----
-    if not results:
+    # ---- Download images if no videos AND it's not explicitly a reel/video ----
+    is_reel_url = '/reel/' in url.lower() or '/reels/' in url.lower() or '/tv/' in url.lower()
+    if not results and not is_reel_url:
         seen_bases = set()
         for i, iurl in enumerate(image_urls[:10]):  # Max 10 images
             base_match = re.search(r'/([a-zA-Z0-9_-]+)_n\.jpg', iurl)

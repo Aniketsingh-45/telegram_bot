@@ -230,14 +230,6 @@ def _sync_download_instagram(url: str, temp_dir: str) -> List[Dict[str, Any]]:
         'no_warnings': False,
         'http_chunk_size': 10485760,
         'concurrent_fragment_downloads': 4,
-        # Mobile User-Agent to avoid Instagram login walls
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
-                'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 '
-                'Mobile/15E148 Safari/604.1'
-            ),
-        },
     }
     ydl_opts.update(_get_ydl_cookie_opts(temp_dir))
 
@@ -767,7 +759,10 @@ async def process_video_download(chat_id: int, video_url: str, quality: Optional
             clean_err = raw_err.split('\n')[0][:180]
             clean_err = re.sub(r'^(ERROR:\s*(\[[^\]]+\]\s*)?)', '', clean_err).strip()
 
-            if any(k in raw_err for k in ["Sign in to confirm", "player response", "429", "bot"]):
+            if "Unsupported URL" in raw_err:
+                tip = "• Yeh link supported nahi hai. Kripya kisi supported website (jaise YouTube, Instagram, Facebook) ka link bhejein."
+                clean_err = "Unsupported URL"
+            elif any(k in raw_err for k in ["Sign in to confirm", "player response", "429", "bot"]):
                 tip = (
                     "💡 <b>YouTube ne datacenter IP block kiya hai (Bot detection).</b>\n\n"
                     "• <b>Instagram Reels</b>, <b>TikTok</b> ya <b>Twitter</b> videos try karein (ye 100% chalte hain).\n"

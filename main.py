@@ -8,7 +8,8 @@ import collections
 import subprocess
 import uuid
 import html
-from typing import Optional, Dict, Any
+import random
+from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
 # pyrefly: ignore [missing-import]
@@ -47,7 +48,7 @@ logging.getLogger().addHandler(log_capture)
 
 
 # Configurable environment variables
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "8061236263:AAGLbpiAy0VFPdxHD5XB-rwws7wYdb5ptNQ"
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB Telegram Bot API limit
@@ -98,6 +99,11 @@ def is_youtube_video(url: str) -> bool:
     if any(re.search(p, url_lower) for p in shorts_patterns):
         return False
     return any(re.search(p, url) for p in yt_patterns)
+
+
+def is_instagram_url(url: str) -> bool:
+    """Returns True if the URL is an Instagram URL."""
+    return 'instagram.com' in url.lower()
 
 
 async def send_quality_keyboard(client: httpx.AsyncClient, chat_id: int, video_url: str) -> Optional[int]:
@@ -177,42 +183,123 @@ async def edit_message(client: httpx.AsyncClient, chat_id: int, message_id: int,
         logger.warning(f"Error editing message {message_id}: {e}")
 
 
-def _download_instagram_image_fallback(url: str, temp_dir: str) -> Dict[str, Any]:
-    try:
-        res = httpx.get(url, timeout=15.0)
-        # Extract og:image
-        m_img = re.search(r'<meta property="og:image" content="([^"]+)"', res.text)
-        if not m_img:
-            raise ValueError("No og:image found in Instagram fallback.")
-        
-        img_url = html.unescape(m_img.group(1))
-        
-        # Extract title/description
-        title = "Instagram Post"
-        m_title = re.search(r'<meta property="og:description" content="([^"]+)"', res.text)
-        if m_title:
-            title = html.unescape(m_title.group(1))
-            
-        # Download image
-        img_res = httpx.get(img_url, timeout=15.0)
-        img_res.raise_for_status()
-        
-        file_path = os.path.join(temp_dir, f"insta_fallback_{uuid.uuid4().hex[:8]}.jpg")
-        with open(file_path, "wb") as f:
-            f.write(img_res.content)
-            
-        return {
-            "file_path": file_path,
-            "title": title[:300],
-            "duration": None,
-            "width": None,
-            "height": None,
-            "file_size": os.path.getsize(file_path),
-            "webpage_url": url
-        }
-    except Exception as e:
-        logger.error(f"Instagram fallback failed: {e}")
-        raise ValueError(f"Failed to download Instagram post: {e}")
+def _get_ydl_cookie_opts(temp_dir: str) -> dict:
+    """
+    Returns yt-dlp cookie options dict if a cookies file/env is found.
+    """
+    cookie_paths = [
+        "/etc/secrets/cookies.txt",   # Render Secret File
+        "/app/cookies.txt",            # Docker container root
+        "cookies.txt",                 # Local dev
+    ]
+    for cp in cookie_paths:
+        if os.path.exists(cp):
+            logger.info(f"Loaded cookies from file: {cp}")
+            return {'cookiefile': cp}
+
+    cookies_data = os.getenv("YOUTUBE_COOKIES", "").strip()
+    if cookies_data:
+        cookies_data = cookies_data.replace("\\n", "\n")
+        cookie_file = os.path.join(temp_dir, "cookies.txt")
+        with open(cookie_file, "w", encoding="utf-8", newline="\n") as cf:
+            cf.write(cookies_data)
+        logger.info(f"Loaded YOUTUBE_COOKIES from env ({len(cookies_data)} chars)")
+        return {'cookiefile': cookie_file}
+
+    logger.info("No cookies found — using mobile player client fallback for YouTube")
+    return {}
+
+
+def _sync_download_instagram(url: str, temp_dir: str) -> List[Dict[str, Any]]:
+    """
+    Downloads Instagram posts/reels/carousels using yt-dlp.
+    Returns a list of media dicts supporting multiple images/videos in a carousel.
+    """
+    outtmpl = os.path.join(temp_dir, "insta_%(playlist_index)s_%(id)s.%(ext)s")
+
+    ydl_opts = {
+        # Best video+audio merged — critical for Reels sound
+        'format': 'bestvideo+bestaudio/best',
+        'outtmpl': outtmpl,
+        'merge_output_format': 'mp4',
+        'postprocessor_args': {
+            'merger': ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k']
+        },
+        'noplaylist': False,   # Allow carousel to download all items
+        'quiet': False,
+        'no_warnings': False,
+        'http_chunk_size': 10485760,
+        'concurrent_fragment_downloads': 4,
+        # Mobile User-Agent to avoid Instagram login walls
+        'http_headers': {
+            'User-Agent': (
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+                'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 '
+                'Mobile/15E148 Safari/604.1'
+            ),
+        },
+    }
+    ydl_opts.update(_get_ydl_cookie_opts(temp_dir))
+
+    results = []
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if not info:
+            raise ValueError("No info extracted from Instagram URL.")
+
+        # Handle playlist/carousel (multiple entries) or single media
+        entries = info.get('entries') or [info]
+        logger.info(f"Instagram: found {len(entries)} media item(s)")
+
+        for entry in entries:
+            if not entry:
+                continue
+            prep = ydl.prepare_filename(entry)
+            base_no_ext = os.path.splitext(prep)[0]
+
+            target_file = None
+            for candidate in [f"{base_no_ext}.mp4", prep]:
+                if os.path.isfile(candidate):
+                    target_file = candidate
+                    break
+
+            if not target_file:
+                # Scan temp_dir for any new media file not already tracked
+                already_found = {r['file_path'] for r in results}
+                all_files = [
+                    os.path.join(temp_dir, f)
+                    for f in os.listdir(temp_dir)
+                    if not f.endswith(('.part', '.ytdl', '.json'))
+                    and os.path.isfile(os.path.join(temp_dir, f))
+                    and os.path.join(temp_dir, f) not in already_found
+                ]
+                if all_files:
+                    target_file = max(all_files, key=os.path.getsize)
+
+            if not target_file:
+                logger.warning(f"Could not find output file for entry: {entry.get('id')}")
+                continue
+
+            is_image = target_file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+            if not is_image:
+                # Always re-encode audio to AAC-LC for Telegram compatibility
+                target_file = _ensure_telegram_audio(target_file)
+
+            results.append({
+                'file_path': target_file,
+                'title': entry.get('title', '') or info.get('title', 'Instagram Post'),
+                'duration': entry.get('duration'),
+                'width': entry.get('width'),
+                'height': entry.get('height'),
+                'file_size': os.path.getsize(target_file),
+                'webpage_url': entry.get('webpage_url', url),
+                'is_image': is_image,
+            })
+
+    if not results:
+        raise ValueError("No media files were downloaded from Instagram.")
+
+    return results
 
 
 def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Dict[str, Any]:
@@ -220,10 +307,9 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
     Synchronous worker running yt-dlp download in a background thread.
     Returns metadata dict with filepath, title, duration, and file size.
     quality: '360', '480', '720', '1080' for YouTube; None = auto-best
+    Instagram URLs are handled by _sync_download_instagram instead.
     """
     outtmpl = os.path.join(temp_dir, "video_%(id)s.%(ext)s")
-
-    is_ig_fb = 'instagram.com' in url or 'facebook.com' in url or 'fb.watch' in url
 
     # Build format string based on requested quality
     if quality:
@@ -234,21 +320,22 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
             f"best[height<={h}]/best"
         )
     else:
-        fmt = 'b[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/b/best'
+        # Always merge best video + audio for proper sound
+        fmt = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/b[ext=mp4]/best'
 
     ydl_opts = {
         'format': fmt,
         'outtmpl': outtmpl,
         'merge_output_format': 'mp4',
         'postprocessor_args': {
-            'merger': ['-c:v', 'copy', '-c:a', 'aac']
+            'merger': ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k']
         },
         'http_chunk_size': 10485760,  # 10MB chunks
         'concurrent_fragment_downloads': 5,
         'noplaylist': True,
         'quiet': False,
         'no_warnings': False,
-        # Use mobile player clients to bypass YouTube datacenter bot detection (avoid 'web')
+        # Use mobile player clients to bypass YouTube datacenter bot detection
         'extractor_args': {
             'youtube': {
                 'player_client': ['android', 'ios'],
@@ -256,123 +343,96 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
         },
     }
 
-    # Support cookies for bypassing YouTube datacenter bot checks
-    # Check multiple possible paths for cookie file
-    cookie_paths = [
-        "/etc/secrets/cookies.txt",   # Render Secret File
-        "/app/cookies.txt",            # Docker container root
-        "cookies.txt",                 # Local dev
-    ]
-    cookie_file_found = None
-    for cp in cookie_paths:
-        if os.path.exists(cp):
-            cookie_file_found = cp
-            break
+    # Add cookies if available
+    ydl_opts.update(_get_ydl_cookie_opts(temp_dir))
 
-    if cookie_file_found:
-        logger.info(f"Loaded cookies from file: {cookie_file_found}")
-        ydl_opts['cookiefile'] = cookie_file_found
-    else:
-        # Fallback: YOUTUBE_COOKIES env var
-        cookies_data = os.getenv("YOUTUBE_COOKIES", "").strip()
-        if cookies_data:
-            cookies_data = cookies_data.replace("\\n", "\n")
-            cookie_file = os.path.join(temp_dir, "cookies.txt")
-            with open(cookie_file, "w", encoding="utf-8", newline="\n") as cf:
-                cf.write(cookies_data)
-            logger.info(f"Loaded YOUTUBE_COOKIES from env ({len(cookies_data)} chars)")
-            ydl_opts['cookiefile'] = cookie_file
-        else:
-            logger.info("No cookies found — using mobile player client fallback for YouTube")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if not info:
+            raise ValueError("No video information could be retrieved.")
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not info:
-                raise ValueError("No video information could be retrieved.")
-            
-            # Resolve output file accurately
-            target_file = None
-            prep = ydl.prepare_filename(info)
-            base_no_ext = os.path.splitext(prep)[0]
-            for candidate in [f"{base_no_ext}.mp4", prep]:
-                if os.path.isfile(candidate):
-                    target_file = candidate
-                    break
-                    
-            if not target_file:
-                # Fallback to finding the largest valid .mp4 file in temp_dir
-                mp4_files = [
+        # Resolve output file accurately
+        target_file = None
+        prep = ydl.prepare_filename(info)
+        base_no_ext = os.path.splitext(prep)[0]
+        for candidate in [f"{base_no_ext}.mp4", prep]:
+            if os.path.isfile(candidate):
+                target_file = candidate
+                break
+
+        if not target_file:
+            # Fallback to finding the largest valid .mp4 file in temp_dir
+            mp4_files = [
+                os.path.join(temp_dir, f)
+                for f in os.listdir(temp_dir)
+                if f.endswith('.mp4') and not f.endswith(('.part', '.ytdl')) and os.path.isfile(os.path.join(temp_dir, f))
+            ]
+            if mp4_files:
+                target_file = max(mp4_files, key=os.path.getsize)
+            else:
+                found_files = [
                     os.path.join(temp_dir, f)
                     for f in os.listdir(temp_dir)
-                    if f.endswith('.mp4') and not f.endswith(('.part', '.ytdl')) and os.path.isfile(os.path.join(temp_dir, f))
+                    if not f.endswith(('.part', '.ytdl')) and os.path.isfile(os.path.join(temp_dir, f))
                 ]
-                if mp4_files:
-                    target_file = max(mp4_files, key=os.path.getsize)
-                else:
-                    found_files = [
-                        os.path.join(temp_dir, f)
-                        for f in os.listdir(temp_dir)
-                        if not f.endswith(('.part', '.ytdl')) and os.path.isfile(os.path.join(temp_dir, f))
-                    ]
-                    if not found_files:
-                        raise FileNotFoundError("Video file was not created by yt-dlp.")
-                    target_file = max(found_files, key=os.path.getsize)
+                if not found_files:
+                    raise FileNotFoundError("Video file was not created by yt-dlp.")
+                target_file = max(found_files, key=os.path.getsize)
 
-            # Guarantee audio is standardized to AAC-LC for 100% Telegram audio compatibility
-            final_file = _ensure_telegram_audio(target_file)
+        # Guarantee audio is standardized to AAC-LC for 100% Telegram audio compatibility
+        final_file = _ensure_telegram_audio(target_file)
 
-            return {
-                "file_path": final_file,
-                "title": info.get("title", "Video"),
-                "duration": info.get("duration", 0),
-                "width": info.get("width"),
-                "height": info.get("height"),
-                "file_size": os.path.getsize(final_file),
-                "webpage_url": info.get("webpage_url", url)
-            }
-    except Exception as e:
-        if is_ig_fb:
-            logger.info(f"yt-dlp failed for IG/FB ({e}), attempting fallback image extraction...")
-            return _download_instagram_image_fallback(url, temp_dir)
-        raise e
+        return {
+            "file_path": final_file,
+            "title": info.get("title", "Video"),
+            "duration": info.get("duration", 0),
+            "width": info.get("width"),
+            "height": info.get("height"),
+            "file_size": os.path.getsize(final_file),
+            "webpage_url": info.get("webpage_url", url)
+        }
 
 
 def _ensure_telegram_audio(input_file: str) -> str:
     """
-    Ensures video audio is converted to standard AAC-LC so Telegram players
-    on Android, iOS, Desktop, and Web can play it with crystal clear audio.
+    Always re-encodes audio to standard AAC-LC stereo so Telegram players on
+    Android, iOS, Desktop, and Web can play it with full sound.
+    This fixes Instagram Reels that sometimes have silent/missing audio.
     """
     try:
         probe = subprocess.run([
             'ffprobe', '-v', 'error',
-            '-show_entries', 'stream=codec_type',
+            '-show_entries', 'stream=codec_type,codec_name',
             '-select_streams', 'a',
             '-of', 'csv=p=0',
             input_file
-        ], capture_output=True, text=True)
+        ], capture_output=True, text=True, timeout=30)
 
         if 'audio' not in probe.stdout:
-            logger.info("Source video has no audio stream to convert.")
+            logger.info("Source has no audio stream — skipping re-encode.")
             return input_file
 
         output_file = os.path.splitext(input_file)[0] + "_playable.mp4"
+        # Always re-encode audio to AAC-LC stereo at 128k/44100Hz for max compatibility
         cmd = [
             'ffmpeg', '-y', '-i', input_file,
             '-c:v', 'copy',
-            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-ar', '44100',
+            '-ac', '2',          # force stereo
             '-movflags', '+faststart',
             output_file
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if res.returncode == 0 and os.path.isfile(output_file) and os.path.getsize(output_file) > 0:
-            logger.info(f"Re-encoded audio to standard AAC-LC: {output_file}")
+            logger.info(f"Re-encoded audio to AAC-LC stereo: {output_file}")
             return output_file
         else:
-            logger.warning(f"FFmpeg audio conversion fallback to original: {res.stderr}")
+            logger.warning(f"FFmpeg audio re-encode failed, using original. stderr: {res.stderr[-300:]}")
             return input_file
     except Exception as e:
-        logger.warning(f"Error checking/converting audio: {e}")
+        logger.warning(f"Error in _ensure_telegram_audio: {e}")
         return input_file
 
 
@@ -385,6 +445,187 @@ async def action_ticker(client: httpx.AsyncClient, chat_id: int, action: str, st
             await asyncio.wait_for(stop_ev.wait(), timeout=4.0)
         except asyncio.TimeoutError:
             pass
+
+
+async def _send_media_item(
+    client: httpx.AsyncClient,
+    chat_id: int,
+    media: Dict[str, Any],
+    caption: str,
+    index: int,
+    total: int
+) -> bool:
+    """
+    Sends a single media item (photo or video) to Telegram.
+    Returns True on success.
+    """
+    file_path = media['file_path']
+    is_image = media.get('is_image', file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')))
+    duration = media.get('duration')
+    file_size = media.get('file_size', os.path.getsize(file_path))
+
+    if file_size > MAX_TELEGRAM_SIZE_BYTES:
+        size_mb = round(file_size / (1024 * 1024), 1)
+        logger.warning(f"Media item {index}/{total} too large: {size_mb} MB — skipping.")
+        return False
+
+    # Bypass Telegram deduplication cache by appending a random byte
+    with open(file_path, "ab") as f:
+        f.write(bytes([random.randint(0, 255)]))
+
+    # Only include caption on first item if multiple
+    item_caption = caption if index == 1 else ""
+
+    with open(file_path, "rb") as f:
+        filename = os.path.basename(file_path)
+        if is_image:
+            files = {"photo": (filename, f, "image/jpeg")}
+            data = {
+                "chat_id": str(chat_id),
+                "caption": item_caption,
+                "parse_mode": "HTML"
+            }
+            api_endpoint = f"{TELEGRAM_API}/sendPhoto"
+        else:
+            files = {"video": (filename, f, "video/mp4")}
+            data = {
+                "chat_id": str(chat_id),
+                "caption": item_caption,
+                "parse_mode": "HTML",
+                "supports_streaming": "true"
+            }
+            if duration:
+                data["duration"] = str(int(duration))
+            if media.get("width"):
+                data["width"] = str(media["width"])
+            if media.get("height"):
+                data["height"] = str(media["height"])
+            api_endpoint = f"{TELEGRAM_API}/sendVideo"
+
+        resp = await client.post(api_endpoint, data=data, files=files)
+
+    if resp.status_code == 200:
+        logger.info(f"Sent media item {index}/{total} to chat {chat_id}")
+        return True
+    else:
+        logger.error(f"Failed to send media item {index}/{total}: {resp.text}")
+        return False
+
+
+async def process_instagram_download(chat_id: int, video_url: str):
+    """
+    Background worker specifically for Instagram posts/reels/carousels.
+    Handles downloading multiple images/videos in a carousel post.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="tg_insta_")
+    stop_ticker = asyncio.Event()
+
+    timeout_cfg = httpx.Timeout(600.0, connect=60.0)
+    async with httpx.AsyncClient(timeout=timeout_cfg) as client:
+        ticker_task = asyncio.create_task(action_ticker(client, chat_id, "upload_photo", stop_ticker))
+
+        status_msg = await send_message(
+            client, chat_id,
+            "🔍 <b>Instagram link mila!</b> Media fetch ki ja rahi hai, kripya intezaar karein..."
+        )
+        status_msg_id = status_msg.get("result", {}).get("message_id") if status_msg else None
+
+        try:
+            if status_msg_id:
+                await edit_message(
+                    client, chat_id, status_msg_id,
+                    "⬇️ <b>Instagram se media download ho raha hai...</b>"
+                )
+
+            logger.info(f"Downloading Instagram media from {video_url} for chat {chat_id}...")
+            media_list = await asyncio.to_thread(_sync_download_instagram, video_url, temp_dir)
+
+            total = len(media_list)
+            logger.info(f"Downloaded {total} Instagram media item(s)")
+
+            if status_msg_id:
+                item_word = "items" if total > 1 else "item"
+                await edit_message(
+                    client, chat_id, status_msg_id,
+                    f"📤 <b>{total} media {item_word} download ho gaye! Telegram par bhej raha hoon...</b>"
+                )
+
+            # Build caption from first item title
+            first_title = media_list[0].get('title', 'Instagram Post') if media_list else 'Instagram Post'
+            if re.match(r'^[\d_\-]+$', first_title.strip()):
+                first_title = "Instagram Post"
+            caption = f"📸 <b>{first_title[:250]}</b>"
+            caption += "\n\n🤖 <i>Downloaded via @AniketVideo_bot</i>"
+
+            has_video = any(not m.get('is_image', True) for m in media_list)
+            if has_video:
+                caption += "\n🔊 <i>Agar aawaz na aaye toh video ke speaker icon par tap karein!</i>"
+
+            success_count = 0
+            for i, media in enumerate(media_list, 1):
+                await send_chat_action(
+                    client, chat_id,
+                    "upload_photo" if media.get('is_image') else "upload_video"
+                )
+                ok = await _send_media_item(client, chat_id, media, caption, i, total)
+                if ok:
+                    success_count += 1
+
+            # Delete status message
+            if status_msg_id:
+                try:
+                    await client.post(f"{TELEGRAM_API}/deleteMessage", json={
+                        "chat_id": chat_id,
+                        "message_id": status_msg_id
+                    })
+                except Exception:
+                    pass
+
+            if success_count == 0:
+                await send_message(
+                    client, chat_id,
+                    "❌ <b>Koi bhi media send nahi ho paya.</b> Shayad post private hai ya size limit exceed ho gayi."
+                )
+            elif success_count < total:
+                await send_message(
+                    client, chat_id,
+                    f"⚠️ <b>{success_count}/{total} media items send ho gaye.</b> Kuch items size limit ki wajah se skip ho gaye."
+                )
+
+        except yt_dlp.utils.DownloadError as e:
+            logger.error(f"yt-dlp DownloadError for Instagram: {e}")
+            raw_err = str(e).strip()
+            clean_err = raw_err.split('\n')[0][:180]
+            clean_err = re.sub(r'^(ERROR:\s*(\[[^\]]+\]\s*)?)', '', clean_err).strip()
+            err_text = (
+                "❌ <b>Instagram media download nahi ho paya!</b>\n\n"
+                f"⚠️ <b>Karan:</b> <code>{clean_err}</code>\n\n"
+                "💡 <b>Tips:</b>\n"
+                "• Check karein ki post <b>public</b> hai (private posts download nahi hoti)\n"
+                "• Instagram Reels aur public posts work karte hain\n"
+                "• Dobara try karein, thodi der mein kaam kar sakta hai"
+            )
+            if status_msg_id:
+                await edit_message(client, chat_id, status_msg_id, err_text)
+            else:
+                await send_message(client, chat_id, err_text)
+
+        except Exception as e:
+            logger.error(f"Unexpected error in process_instagram_download: {e}", exc_info=True)
+            err_text = f"❌ <b>Kuch gadbad ho gayi:</b> {str(e)[:150]}"
+            if status_msg_id:
+                await edit_message(client, chat_id, status_msg_id, err_text)
+            else:
+                await send_message(client, chat_id, err_text)
+
+        finally:
+            stop_ticker.set()
+            ticker_task.cancel()
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                logger.info(f"Cleaned up temp directory: {temp_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to clean temp dir: {e}")
 
 
 async def process_video_download(chat_id: int, video_url: str, quality: Optional[str] = None):
@@ -469,7 +710,6 @@ async def process_video_download(chat_id: int, video_url: str, quality: Optional
 
             # Bypass Telegram Deduplication Cache by appending a random byte
             with open(file_path, "ab") as f:
-                import random
                 f.write(bytes([random.randint(0, 255)]))
 
             # Upload media directly using multipart/form-data
@@ -493,7 +733,7 @@ async def process_video_download(chat_id: int, video_url: str, quality: Optional
                         "supports_streaming": "true"
                     }
                     if duration:
-                        data["duration"] = str(duration)
+                        data["duration"] = str(int(duration))
                     if video_data.get("width"):
                         data["width"] = str(video_data["width"])
                     if video_data.get("height"):
@@ -688,7 +928,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 "👋 <b>Namaste! Main aapka Video Downloader Bot hoon.</b>\n\n"
                 "Aap mujhe in platforms ke video links bhej sakte hain:\n"
                 "• 🎬 <b>YouTube</b> (Videos & Shorts)\n"
-                "• 📸 <b>Instagram</b> (Reels & Posts)\n"
+                "• 📸 <b>Instagram</b> (Reels, Posts & Carousels 🆕)\n"
                 "• 🐦 <b>Twitter / X</b>\n"
                 "• 🎵 <b>Facebook, TikTok aur anya websites!</b>\n\n"
                 "🚀 <i>Bas koi bhi video link copy karke yahan bhejiye!</i>"
@@ -719,8 +959,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     msg_id = await send_quality_keyboard(client, chat_id, video_url)
                 # Store pending download until user picks quality
                 pending_downloads[chat_id] = {"url": video_url, "message_id": msg_id}
+            elif is_instagram_url(video_url):
+                # Instagram: dedicated handler supports carousels & multi-image posts
+                background_tasks.add_task(process_instagram_download, chat_id, video_url)
             else:
-                # Shorts, Reels, Posts → direct download, no quality prompt
+                # Shorts, TikTok, Twitter, etc. → direct download
                 background_tasks.add_task(process_video_download, chat_id, video_url)
         else:
             invalid_text = (

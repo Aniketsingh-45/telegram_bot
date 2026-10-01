@@ -867,11 +867,18 @@ async def process_instagram_download(chat_id: int, video_url: str):
             raw_err = str(e).strip()
             clean_err = raw_err.split('\n')[0][:180]
             clean_err = re.sub(r'^(ERROR:\s*(\[[^\]]+\]\s*)?)', '', clean_err).strip()
-            if 'login' in raw_err.lower() or 'cookies' in raw_err.lower() or 'empty media' in raw_err.lower():
+            if 'cookies may be expired' in raw_err.lower():
+                err_text = (
+                    "❌ <b>Instagram Cookies Expire ho gayi hain!</b>\n\n"
+                    "⚠️ Aapki `instagram_cookies.txt` file mil gayi hai, lekin lagta hai cookies ab purani ho gayi hain (Instagram inhe jaldi expire kar deta hai).\n\n"
+                    "🔧 <b>Solution:</b> Browser me wapas jayein, refresh karke cookies dobara export karein aur Render par us Secret File ko update karein.\n\n"
+                    "💡 <i>Tip: Instagram me 2-Factor Auth (2FA) band karke try karein, cookies zyada chalengi.</i>"
+                )
+            elif 'login' in raw_err.lower() or 'cookies' in raw_err.lower() or 'empty media' in raw_err.lower():
                 err_text = (
                     "❌ <b>Instagram media download nahi ho paya!</b>\n\n"
                     "⚠️ Instagram ab login maangta hai. Server se bina login ke download nahi hota.\n\n"
-                    "🔧 <b>Solution:</b> Bot admin ko <code>INSTAGRAM_COOKIES</code> environment variable set karna hoga "
+                    "🔧 <b>Solution:</b> Bot admin ko Render ki Secret Files me <code>instagram_cookies.txt</code> set karni hogi "
                     "apne Instagram session cookies ke saath.\n\n"
                     "💡 <i>Public Reels abhi bhi kaam kar sakti hain — dobara try karein!</i>"
                 )

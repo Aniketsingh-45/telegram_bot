@@ -232,110 +232,181 @@ def _extract_instagram_shortcode(url: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _load_cookies_as_dict(temp_dir: str) -> dict:
+    """
+    Load cookies from INSTAGRAM_COOKIES env or cookie files and return
+    a dict suitable for httpx cookies parameter.
+    """
+    cookie_dict = {}
+    cookie_file_path = None
+
+    # Find cookie file
+    for cp in [
+        "/etc/secrets/instagram_cookies.txt",
+        "/app/instagram_cookies.txt",
+        "instagram_cookies.txt",
+        "/etc/secrets/cookies.txt",
+        "/app/cookies.txt",
+        "cookies.txt",
+    ]:
+        if os.path.exists(cp):
+            cookie_file_path = cp
+            break
+
+    if not cookie_file_path:
+        # Try env vars
+        for env_key in ["INSTAGRAM_COOKIES", "YOUTUBE_COOKIES"]:
+            cookies_data = os.getenv(env_key, "").strip()
+            if cookies_data:
+                cookies_data = cookies_data.replace("\\n", "\n")
+                cookie_file_path = os.path.join(temp_dir, "http_cookies.txt")
+                with open(cookie_file_path, "w", encoding="utf-8", newline="\n") as cf:
+                    cf.write(cookies_data)
+                break
+
+    if cookie_file_path:
+        try:
+            with open(cookie_file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.split('\t')
+                    if len(parts) >= 7:
+                        cookie_dict[parts[5]] = parts[6]
+        except Exception as e:
+            logger.warning(f"Failed to parse cookie file: {e}")
+
+    return cookie_dict
+
+
 def _scrape_instagram_media(url: str, temp_dir: str) -> List[Dict[str, Any]]:
     """
-    Fallback: Directly scrape Instagram's embed page and HTML for media URLs.
-    Works for some public posts even without login.
+    Fallback: scrape Instagram pages for media URLs using cookies.
+    Tries multiple page types: embed, main page, API endpoint.
     """
     shortcode = _extract_instagram_shortcode(url)
     if not shortcode:
         raise ValueError("Cannot extract shortcode from Instagram URL")
 
+    # Load cookies for HTTP requests
+    cookie_dict = _load_cookies_as_dict(temp_dir)
+    has_http_cookies = bool(cookie_dict)
+    logger.info(f"Embed scraping: have {len(cookie_dict)} HTTP cookies")
+
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
         'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Ch-Ua-Platform': '"Windows"',
     }
 
     results = []
+    all_page_contents = []
 
-    # Strategy A: Try the embed page
-    embed_urls_to_try = [
+    # ---- Try multiple page sources ----
+    urls_to_try = [
+        # Main post page (most data when logged in)
+        f"https://www.instagram.com/p/{shortcode}/",
+        f"https://www.instagram.com/reel/{shortcode}/",
+        # Embed pages
         f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
         f"https://www.instagram.com/p/{shortcode}/embed/",
         f"https://www.instagram.com/reel/{shortcode}/embed/",
+        # API endpoint
+        f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis",
     ]
 
-    page_content = ""
-    for embed_url in embed_urls_to_try:
+    for page_url in urls_to_try:
         try:
-            resp = httpx.get(embed_url, headers=headers, timeout=15.0, follow_redirects=True)
-            if resp.status_code == 200 and len(resp.text) > 1000:
-                page_content = resp.text
-                logger.info(f"Got embed page from {embed_url} ({len(page_content)} chars)")
-                break
+            resp = httpx.get(
+                page_url,
+                headers=headers,
+                cookies=cookie_dict if has_http_cookies else None,
+                timeout=15.0,
+                follow_redirects=True
+            )
+            if resp.status_code == 200 and len(resp.text) > 500:
+                all_page_contents.append(resp.text)
+                logger.info(f"Fetched {page_url} ({len(resp.text)} chars)")
+                # If we got a big page with cookies, that's probably enough
+                if has_http_cookies and len(resp.text) > 10000:
+                    break
         except Exception as e:
-            logger.warning(f"Failed to fetch {embed_url}: {e}")
+            logger.warning(f"Failed to fetch {page_url}: {e}")
 
-    if not page_content:
-        # Strategy B: Try the main page with ?__a=1&__d=dis
-        try:
-            api_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
-            resp = httpx.get(api_url, headers=headers, timeout=15.0, follow_redirects=True)
-            if resp.status_code == 200:
-                page_content = resp.text
-                logger.info(f"Got API page ({len(page_content)} chars)")
-        except Exception as e:
-            logger.warning(f"API endpoint failed: {e}")
-
-    if not page_content:
+    if not all_page_contents:
         raise ValueError("Could not fetch any Instagram page")
 
-    # Extract video URLs from the page content
+    # Combine all page contents for searching
+    combined_content = "\n".join(all_page_contents)
+    logger.info(f"Total scraped content: {len(combined_content)} chars from {len(all_page_contents)} page(s)")
+
+    # ---- Extract video URLs ----
     video_urls = []
-    # Look for video_url in JSON data
     for pattern in [
         r'"video_url"\s*:\s*"([^"]+)"',
-        r'"video_versions".*?"url"\s*:\s*"([^"]+)"',
+        r'"video_versions"\s*:\s*\[.*?"url"\s*:\s*"([^"]+)"',
+        r'"src"\s*:\s*"(https://[^"]*\.mp4[^"]*)"',
         r'<video[^>]+src="([^"]+)"',
         r'"contentUrl"\s*:\s*"([^"]+)"',
         r'"videoUrl"\s*:\s*"([^"]+)"',
+        r'property="og:video"\s+content="([^"]+)"',
+        r'property="og:video:secure_url"\s+content="([^"]+)"',
     ]:
-        found = re.findall(pattern, page_content)
+        found = re.findall(pattern, combined_content)
         for u in found:
-            # Unescape unicode and HTML entities
             clean_u = u.replace('\\u0026', '&').replace('\\/', '/').replace('&amp;', '&')
-            if clean_u not in video_urls:
+            if clean_u not in video_urls and 'instagram' in clean_u.lower() or 'cdninstagram' in clean_u.lower() or 'fbcdn' in clean_u.lower():
                 video_urls.append(clean_u)
 
-    # Extract image URLs
+    # ---- Extract image URLs ----
     image_urls = []
     for pattern in [
         r'"display_url"\s*:\s*"([^"]+)"',
         r'"display_src"\s*:\s*"([^"]+)"',
-        r'"src"\s*:\s*"(https://[^"]*instagram[^"]*\.jpg[^"]*)"',
+        r'"image_versions2".*?"url"\s*:\s*"([^"]+)"',
+        r'property="og:image"\s+content="([^"]+)"',
         r'"thumbnail_src"\s*:\s*"([^"]+)"',
         r'class="EmbeddedMediaImage"[^>]+src="([^"]+)"',
     ]:
-        found = re.findall(pattern, page_content)
+        found = re.findall(pattern, combined_content)
         for u in found:
             clean_u = u.replace('\\u0026', '&').replace('\\/', '/').replace('&amp;', '&')
             if clean_u not in image_urls and 's150x150' not in clean_u and 's320x320' not in clean_u:
                 image_urls.append(clean_u)
 
-    # Extract title/description
+    # ---- Extract title ----
     title = "Instagram Post"
-    m_title = re.search(r'"caption"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]{1,300})"', page_content)
+    m_title = re.search(r'"text"\s*:\s*"([^"]{1,300})"', combined_content)
     if m_title:
-        title = m_title.group(1)[:200]
-    else:
-        m_title = re.search(r'<meta property="og:description" content="([^"]+)"', page_content)
+        raw = m_title.group(1)
+        # Skip if it looks like JSON metadata, not a caption
+        if len(raw) > 5 and not raw.startswith('{'):
+            title = raw[:200]
+    if title == "Instagram Post":
+        m_title = re.search(r'<meta property="og:description" content="([^"]+)"', combined_content)
         if m_title:
             title = html.unescape(m_title.group(1))[:200]
 
-    logger.info(f"Scraped {len(video_urls)} video(s) and {len(image_urls)} image(s) from embed page")
+    logger.info(f"Scraped {len(video_urls)} video URL(s) and {len(image_urls)} image URL(s)")
 
-    # Download video URLs
-    for i, vurl in enumerate(video_urls):
+    # ---- Download videos ----
+    dl_headers = {
+        'User-Agent': headers['User-Agent'],
+        'Referer': 'https://www.instagram.com/',
+    }
+    for i, vurl in enumerate(video_urls[:5]):  # Max 5 videos
         try:
             file_path = os.path.join(temp_dir, f"insta_scraped_v{i}_{uuid.uuid4().hex[:6]}.mp4")
-            resp = httpx.get(vurl, headers=headers, timeout=30.0, follow_redirects=True)
+            resp = httpx.get(vurl, headers=dl_headers, timeout=60.0, follow_redirects=True)
             resp.raise_for_status()
             with open(file_path, "wb") as f:
                 f.write(resp.content)
-            if os.path.getsize(file_path) > 1000:  # Must be > 1KB to be a real video
-                # Re-encode audio for Telegram
+            fsize = os.path.getsize(file_path)
+            if fsize > 5000:  # Must be > 5KB to be a real video
                 file_path = _ensure_telegram_audio(file_path)
                 results.append({
                     'file_path': file_path,
@@ -347,43 +418,44 @@ def _scrape_instagram_media(url: str, temp_dir: str) -> List[Dict[str, Any]]:
                     'webpage_url': url,
                     'is_image': False,
                 })
+                logger.info(f"Downloaded scraped video {i}: {fsize} bytes")
         except Exception as e:
             logger.warning(f"Failed to download scraped video {i}: {e}")
 
-    # If no videos found, download images
+    # ---- Download images if no videos ----
     if not results:
-        # Deduplicate: keep only the highest-quality version of each image
         seen_bases = set()
-        for i, iurl in enumerate(image_urls):
-            # Extract base image ID to skip duplicates
+        for i, iurl in enumerate(image_urls[:10]):  # Max 10 images
             base_match = re.search(r'/([a-zA-Z0-9_-]+)_n\.jpg', iurl)
-            base_id = base_match.group(1) if base_match else iurl
+            base_id = base_match.group(1) if base_match else str(i)
             if base_id in seen_bases:
                 continue
             seen_bases.add(base_id)
 
             try:
                 file_path = os.path.join(temp_dir, f"insta_scraped_i{i}_{uuid.uuid4().hex[:6]}.jpg")
-                resp = httpx.get(iurl, headers=headers, timeout=15.0, follow_redirects=True)
+                resp = httpx.get(iurl, headers=dl_headers, timeout=15.0, follow_redirects=True)
                 resp.raise_for_status()
                 with open(file_path, "wb") as f:
                     f.write(resp.content)
-                if os.path.getsize(file_path) > 1000:
+                fsize = os.path.getsize(file_path)
+                if fsize > 1000:
                     results.append({
                         'file_path': file_path,
                         'title': title,
                         'duration': None,
                         'width': None,
                         'height': None,
-                        'file_size': os.path.getsize(file_path),
+                        'file_size': fsize,
                         'webpage_url': url,
                         'is_image': True,
                     })
+                    logger.info(f"Downloaded scraped image {i}: {fsize} bytes")
             except Exception as e:
                 logger.warning(f"Failed to download scraped image {i}: {e}")
 
     if not results:
-        raise ValueError("No media could be scraped from Instagram embed page")
+        raise ValueError(f"Scraped {len(video_urls)} video URLs and {len(image_urls)} image URLs but none could be downloaded")
 
     return results
 
@@ -393,7 +465,7 @@ def _sync_download_instagram(url: str, temp_dir: str) -> List[Dict[str, Any]]:
     Downloads Instagram posts/reels/carousels using multiple strategies:
     1. yt-dlp with Instagram cookies (most reliable)
     2. yt-dlp without cookies using 'best' format
-    3. Direct HTTP scraping of embed page (fallback)
+    3. Direct HTTP scraping with cookies (fallback)
     """
     cookie_opts = _get_ydl_cookie_opts(temp_dir, platform="instagram")
     has_cookies = bool(cookie_opts)
@@ -401,8 +473,6 @@ def _sync_download_instagram(url: str, temp_dir: str) -> List[Dict[str, Any]]:
     # ---- Strategy 1 & 2: yt-dlp ----
     outtmpl = os.path.join(temp_dir, "insta_%(playlist_index)s_%(id)s.%(ext)s")
     ydl_opts = {
-        # Use 'best' first (single combined stream — avoids audio merge issues)
-        # then fallback to merge
         'format': 'best[ext=mp4]/best/bestvideo+bestaudio',
         'outtmpl': outtmpl,
         'merge_output_format': 'mp4',
@@ -482,24 +552,22 @@ def _sync_download_instagram(url: str, temp_dir: str) -> List[Dict[str, Any]]:
         logger.warning(f"yt-dlp Instagram failed: {e}")
 
     # ---- Strategy 3: Direct HTTP scraping fallback ----
-    logger.info(f"Trying embed page scraping fallback for {url}...")
+    logger.info(f"Trying HTTP scraping fallback for {url}...")
     try:
         return _scrape_instagram_media(url, temp_dir)
     except Exception as scrape_err:
-        logger.warning(f"Embed scraping also failed: {scrape_err}")
+        logger.warning(f"HTTP scraping also failed: {scrape_err}")
 
-    # All strategies failed — raise with helpful message
+    # All strategies failed
     if has_cookies:
-        raise ValueError(
-            f"Instagram download failed even with cookies. "
-            f"The post may be private or the cookies may have expired. "
-            f"yt-dlp error: {ytdlp_error}"
+        raise yt_dlp.utils.DownloadError(
+            f"Instagram download failed. Cookies may be expired — re-export them from your browser. "
+            f"Original error: {ytdlp_error}"
         )
     else:
-        raise ValueError(
-            f"Instagram download failed. Instagram requires login for most content from server IPs.\n"
-            f"Please set the INSTAGRAM_COOKIES environment variable with your Instagram session cookies.\n"
-            f"yt-dlp error: {ytdlp_error}"
+        raise yt_dlp.utils.DownloadError(
+            f"Instagram requires login cookies. Set INSTAGRAM_COOKIES env variable. "
+            f"Original error: {ytdlp_error}"
         )
 
 

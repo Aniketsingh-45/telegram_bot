@@ -48,7 +48,7 @@ logging.getLogger().addHandler(log_capture)
 
 
 # Configurable environment variables
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "8061236263:AAGLbpiAy0VFPdxHD5XB-rwws7wYdb5ptNQ"
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 MAX_TELEGRAM_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB Telegram Bot API limit
@@ -183,115 +183,324 @@ async def edit_message(client: httpx.AsyncClient, chat_id: int, message_id: int,
         logger.warning(f"Error editing message {message_id}: {e}")
 
 
-def _get_ydl_cookie_opts(temp_dir: str) -> dict:
+def _get_ydl_cookie_opts(temp_dir: str, platform: str = "youtube") -> dict:
     """
     Returns yt-dlp cookie options dict if a cookies file/env is found.
+    platform: 'youtube' or 'instagram' — checks platform-specific cookie sources first.
     """
-    cookie_paths = [
-        "/etc/secrets/cookies.txt",   # Render Secret File
-        "/app/cookies.txt",            # Docker container root
-        "cookies.txt",                 # Local dev
-    ]
+    # Platform-specific cookie paths
+    if platform == "instagram":
+        cookie_paths = [
+            "/etc/secrets/instagram_cookies.txt",
+            "/app/instagram_cookies.txt",
+            "instagram_cookies.txt",
+            "/etc/secrets/cookies.txt",
+            "/app/cookies.txt",
+            "cookies.txt",
+        ]
+        env_keys = ["INSTAGRAM_COOKIES", "YOUTUBE_COOKIES"]
+    else:
+        cookie_paths = [
+            "/etc/secrets/cookies.txt",
+            "/app/cookies.txt",
+            "cookies.txt",
+        ]
+        env_keys = ["YOUTUBE_COOKIES"]
+
     for cp in cookie_paths:
         if os.path.exists(cp):
-            logger.info(f"Loaded cookies from file: {cp}")
+            logger.info(f"Loaded {platform} cookies from file: {cp}")
             return {'cookiefile': cp}
 
-    cookies_data = os.getenv("YOUTUBE_COOKIES", "").strip()
-    if cookies_data:
-        cookies_data = cookies_data.replace("\\n", "\n")
-        cookie_file = os.path.join(temp_dir, "cookies.txt")
-        with open(cookie_file, "w", encoding="utf-8", newline="\n") as cf:
-            cf.write(cookies_data)
-        logger.info(f"Loaded YOUTUBE_COOKIES from env ({len(cookies_data)} chars)")
-        return {'cookiefile': cookie_file}
+    for env_key in env_keys:
+        cookies_data = os.getenv(env_key, "").strip()
+        if cookies_data:
+            cookies_data = cookies_data.replace("\\n", "\n")
+            cookie_file = os.path.join(temp_dir, f"{platform}_cookies.txt")
+            with open(cookie_file, "w", encoding="utf-8", newline="\n") as cf:
+                cf.write(cookies_data)
+            logger.info(f"Loaded {env_key} from env ({len(cookies_data)} chars)")
+            return {'cookiefile': cookie_file}
 
-    logger.info("No cookies found — using mobile player client fallback for YouTube")
+    logger.info(f"No {platform} cookies found")
     return {}
+
+
+def _extract_instagram_shortcode(url: str) -> Optional[str]:
+    """Extracts the shortcode from an Instagram URL."""
+    match = re.search(r'instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)', url)
+    return match.group(1) if match else None
+
+
+def _scrape_instagram_media(url: str, temp_dir: str) -> List[Dict[str, Any]]:
+    """
+    Fallback: Directly scrape Instagram's embed page and HTML for media URLs.
+    Works for some public posts even without login.
+    """
+    shortcode = _extract_instagram_shortcode(url)
+    if not shortcode:
+        raise ValueError("Cannot extract shortcode from Instagram URL")
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Sec-Fetch-Mode': 'navigate',
+    }
+
+    results = []
+
+    # Strategy A: Try the embed page
+    embed_urls_to_try = [
+        f"https://www.instagram.com/p/{shortcode}/embed/captioned/",
+        f"https://www.instagram.com/p/{shortcode}/embed/",
+        f"https://www.instagram.com/reel/{shortcode}/embed/",
+    ]
+
+    page_content = ""
+    for embed_url in embed_urls_to_try:
+        try:
+            resp = httpx.get(embed_url, headers=headers, timeout=15.0, follow_redirects=True)
+            if resp.status_code == 200 and len(resp.text) > 1000:
+                page_content = resp.text
+                logger.info(f"Got embed page from {embed_url} ({len(page_content)} chars)")
+                break
+        except Exception as e:
+            logger.warning(f"Failed to fetch {embed_url}: {e}")
+
+    if not page_content:
+        # Strategy B: Try the main page with ?__a=1&__d=dis
+        try:
+            api_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
+            resp = httpx.get(api_url, headers=headers, timeout=15.0, follow_redirects=True)
+            if resp.status_code == 200:
+                page_content = resp.text
+                logger.info(f"Got API page ({len(page_content)} chars)")
+        except Exception as e:
+            logger.warning(f"API endpoint failed: {e}")
+
+    if not page_content:
+        raise ValueError("Could not fetch any Instagram page")
+
+    # Extract video URLs from the page content
+    video_urls = []
+    # Look for video_url in JSON data
+    for pattern in [
+        r'"video_url"\s*:\s*"([^"]+)"',
+        r'"video_versions".*?"url"\s*:\s*"([^"]+)"',
+        r'<video[^>]+src="([^"]+)"',
+        r'"contentUrl"\s*:\s*"([^"]+)"',
+        r'"videoUrl"\s*:\s*"([^"]+)"',
+    ]:
+        found = re.findall(pattern, page_content)
+        for u in found:
+            # Unescape unicode and HTML entities
+            clean_u = u.replace('\\u0026', '&').replace('\\/', '/').replace('&amp;', '&')
+            if clean_u not in video_urls:
+                video_urls.append(clean_u)
+
+    # Extract image URLs
+    image_urls = []
+    for pattern in [
+        r'"display_url"\s*:\s*"([^"]+)"',
+        r'"display_src"\s*:\s*"([^"]+)"',
+        r'"src"\s*:\s*"(https://[^"]*instagram[^"]*\.jpg[^"]*)"',
+        r'"thumbnail_src"\s*:\s*"([^"]+)"',
+        r'class="EmbeddedMediaImage"[^>]+src="([^"]+)"',
+    ]:
+        found = re.findall(pattern, page_content)
+        for u in found:
+            clean_u = u.replace('\\u0026', '&').replace('\\/', '/').replace('&amp;', '&')
+            if clean_u not in image_urls and 's150x150' not in clean_u and 's320x320' not in clean_u:
+                image_urls.append(clean_u)
+
+    # Extract title/description
+    title = "Instagram Post"
+    m_title = re.search(r'"caption"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]{1,300})"', page_content)
+    if m_title:
+        title = m_title.group(1)[:200]
+    else:
+        m_title = re.search(r'<meta property="og:description" content="([^"]+)"', page_content)
+        if m_title:
+            title = html.unescape(m_title.group(1))[:200]
+
+    logger.info(f"Scraped {len(video_urls)} video(s) and {len(image_urls)} image(s) from embed page")
+
+    # Download video URLs
+    for i, vurl in enumerate(video_urls):
+        try:
+            file_path = os.path.join(temp_dir, f"insta_scraped_v{i}_{uuid.uuid4().hex[:6]}.mp4")
+            resp = httpx.get(vurl, headers=headers, timeout=30.0, follow_redirects=True)
+            resp.raise_for_status()
+            with open(file_path, "wb") as f:
+                f.write(resp.content)
+            if os.path.getsize(file_path) > 1000:  # Must be > 1KB to be a real video
+                # Re-encode audio for Telegram
+                file_path = _ensure_telegram_audio(file_path)
+                results.append({
+                    'file_path': file_path,
+                    'title': title,
+                    'duration': None,
+                    'width': None,
+                    'height': None,
+                    'file_size': os.path.getsize(file_path),
+                    'webpage_url': url,
+                    'is_image': False,
+                })
+        except Exception as e:
+            logger.warning(f"Failed to download scraped video {i}: {e}")
+
+    # If no videos found, download images
+    if not results:
+        # Deduplicate: keep only the highest-quality version of each image
+        seen_bases = set()
+        for i, iurl in enumerate(image_urls):
+            # Extract base image ID to skip duplicates
+            base_match = re.search(r'/([a-zA-Z0-9_-]+)_n\.jpg', iurl)
+            base_id = base_match.group(1) if base_match else iurl
+            if base_id in seen_bases:
+                continue
+            seen_bases.add(base_id)
+
+            try:
+                file_path = os.path.join(temp_dir, f"insta_scraped_i{i}_{uuid.uuid4().hex[:6]}.jpg")
+                resp = httpx.get(iurl, headers=headers, timeout=15.0, follow_redirects=True)
+                resp.raise_for_status()
+                with open(file_path, "wb") as f:
+                    f.write(resp.content)
+                if os.path.getsize(file_path) > 1000:
+                    results.append({
+                        'file_path': file_path,
+                        'title': title,
+                        'duration': None,
+                        'width': None,
+                        'height': None,
+                        'file_size': os.path.getsize(file_path),
+                        'webpage_url': url,
+                        'is_image': True,
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to download scraped image {i}: {e}")
+
+    if not results:
+        raise ValueError("No media could be scraped from Instagram embed page")
+
+    return results
 
 
 def _sync_download_instagram(url: str, temp_dir: str) -> List[Dict[str, Any]]:
     """
-    Downloads Instagram posts/reels/carousels using yt-dlp.
-    Returns a list of media dicts supporting multiple images/videos in a carousel.
+    Downloads Instagram posts/reels/carousels using multiple strategies:
+    1. yt-dlp with Instagram cookies (most reliable)
+    2. yt-dlp without cookies using 'best' format
+    3. Direct HTTP scraping of embed page (fallback)
     """
-    outtmpl = os.path.join(temp_dir, "insta_%(playlist_index)s_%(id)s.%(ext)s")
+    cookie_opts = _get_ydl_cookie_opts(temp_dir, platform="instagram")
+    has_cookies = bool(cookie_opts)
 
+    # ---- Strategy 1 & 2: yt-dlp ----
+    outtmpl = os.path.join(temp_dir, "insta_%(playlist_index)s_%(id)s.%(ext)s")
     ydl_opts = {
-        # Best video+audio merged — critical for Reels sound
-        'format': 'bestvideo+bestaudio/best',
+        # Use 'best' first (single combined stream — avoids audio merge issues)
+        # then fallback to merge
+        'format': 'best[ext=mp4]/best/bestvideo+bestaudio',
         'outtmpl': outtmpl,
         'merge_output_format': 'mp4',
         'postprocessor_args': {
             'merger': ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k']
         },
-        'noplaylist': False,   # Allow carousel to download all items
+        'noplaylist': False,
         'quiet': False,
         'no_warnings': False,
         'http_chunk_size': 10485760,
         'concurrent_fragment_downloads': 4,
+        'socket_timeout': 30,
+        'retries': 3,
     }
-    ydl_opts.update(_get_ydl_cookie_opts(temp_dir))
+    ydl_opts.update(cookie_opts)
 
-    results = []
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if not info:
-            raise ValueError("No info extracted from Instagram URL.")
+    ytdlp_error = None
+    try:
+        results = []
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                raise ValueError("No info extracted from Instagram URL.")
 
-        # Handle playlist/carousel (multiple entries) or single media
-        entries = info.get('entries') or [info]
-        logger.info(f"Instagram: found {len(entries)} media item(s)")
+            entries = info.get('entries') or [info]
+            logger.info(f"Instagram yt-dlp: found {len(entries)} media item(s)")
 
-        for entry in entries:
-            if not entry:
-                continue
-            prep = ydl.prepare_filename(entry)
-            base_no_ext = os.path.splitext(prep)[0]
+            for entry in entries:
+                if not entry:
+                    continue
+                prep = ydl.prepare_filename(entry)
+                base_no_ext = os.path.splitext(prep)[0]
 
-            target_file = None
-            for candidate in [f"{base_no_ext}.mp4", prep]:
-                if os.path.isfile(candidate):
-                    target_file = candidate
-                    break
+                target_file = None
+                for candidate in [f"{base_no_ext}.mp4", prep]:
+                    if os.path.isfile(candidate):
+                        target_file = candidate
+                        break
 
-            if not target_file:
-                # Scan temp_dir for any new media file not already tracked
-                already_found = {r['file_path'] for r in results}
-                all_files = [
-                    os.path.join(temp_dir, f)
-                    for f in os.listdir(temp_dir)
-                    if not f.endswith(('.part', '.ytdl', '.json'))
-                    and os.path.isfile(os.path.join(temp_dir, f))
-                    and os.path.join(temp_dir, f) not in already_found
-                ]
-                if all_files:
-                    target_file = max(all_files, key=os.path.getsize)
+                if not target_file:
+                    already_found = {r['file_path'] for r in results}
+                    all_files = [
+                        os.path.join(temp_dir, f)
+                        for f in os.listdir(temp_dir)
+                        if not f.endswith(('.part', '.ytdl', '.json'))
+                        and os.path.isfile(os.path.join(temp_dir, f))
+                        and os.path.join(temp_dir, f) not in already_found
+                    ]
+                    if all_files:
+                        target_file = max(all_files, key=os.path.getsize)
 
-            if not target_file:
-                logger.warning(f"Could not find output file for entry: {entry.get('id')}")
-                continue
+                if not target_file:
+                    logger.warning(f"Could not find output file for entry: {entry.get('id')}")
+                    continue
 
-            is_image = target_file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
-            if not is_image:
-                # Always re-encode audio to AAC-LC for Telegram compatibility
-                target_file = _ensure_telegram_audio(target_file)
+                is_image = target_file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+                if not is_image:
+                    target_file = _ensure_telegram_audio(target_file)
 
-            results.append({
-                'file_path': target_file,
-                'title': entry.get('title', '') or info.get('title', 'Instagram Post'),
-                'duration': entry.get('duration'),
-                'width': entry.get('width'),
-                'height': entry.get('height'),
-                'file_size': os.path.getsize(target_file),
-                'webpage_url': entry.get('webpage_url', url),
-                'is_image': is_image,
-            })
+                results.append({
+                    'file_path': target_file,
+                    'title': entry.get('title', '') or info.get('title', 'Instagram Post'),
+                    'duration': entry.get('duration'),
+                    'width': entry.get('width'),
+                    'height': entry.get('height'),
+                    'file_size': os.path.getsize(target_file),
+                    'webpage_url': entry.get('webpage_url', url),
+                    'is_image': is_image,
+                })
 
-    if not results:
-        raise ValueError("No media files were downloaded from Instagram.")
+        if results:
+            return results
+        ytdlp_error = "yt-dlp returned no media files"
 
-    return results
+    except Exception as e:
+        ytdlp_error = str(e)
+        logger.warning(f"yt-dlp Instagram failed: {e}")
+
+    # ---- Strategy 3: Direct HTTP scraping fallback ----
+    logger.info(f"Trying embed page scraping fallback for {url}...")
+    try:
+        return _scrape_instagram_media(url, temp_dir)
+    except Exception as scrape_err:
+        logger.warning(f"Embed scraping also failed: {scrape_err}")
+
+    # All strategies failed — raise with helpful message
+    if has_cookies:
+        raise ValueError(
+            f"Instagram download failed even with cookies. "
+            f"The post may be private or the cookies may have expired. "
+            f"yt-dlp error: {ytdlp_error}"
+        )
+    else:
+        raise ValueError(
+            f"Instagram download failed. Instagram requires login for most content from server IPs.\n"
+            f"Please set the INSTAGRAM_COOKIES environment variable with your Instagram session cookies.\n"
+            f"yt-dlp error: {ytdlp_error}"
+        )
 
 
 def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Dict[str, Any]:
@@ -336,7 +545,7 @@ def _sync_download(url: str, temp_dir: str, quality: Optional[str] = None) -> Di
     }
 
     # Add cookies if available
-    ydl_opts.update(_get_ydl_cookie_opts(temp_dir))
+    ydl_opts.update(_get_ydl_cookie_opts(temp_dir, platform="youtube"))
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -589,14 +798,22 @@ async def process_instagram_download(chat_id: int, video_url: str):
             raw_err = str(e).strip()
             clean_err = raw_err.split('\n')[0][:180]
             clean_err = re.sub(r'^(ERROR:\s*(\[[^\]]+\]\s*)?)', '', clean_err).strip()
-            err_text = (
-                "❌ <b>Instagram media download nahi ho paya!</b>\n\n"
-                f"⚠️ <b>Karan:</b> <code>{clean_err}</code>\n\n"
-                "💡 <b>Tips:</b>\n"
-                "• Check karein ki post <b>public</b> hai (private posts download nahi hoti)\n"
-                "• Instagram Reels aur public posts work karte hain\n"
-                "• Dobara try karein, thodi der mein kaam kar sakta hai"
-            )
+            if 'login' in raw_err.lower() or 'cookies' in raw_err.lower() or 'empty media' in raw_err.lower():
+                err_text = (
+                    "❌ <b>Instagram media download nahi ho paya!</b>\n\n"
+                    "⚠️ Instagram ab login maangta hai. Server se bina login ke download nahi hota.\n\n"
+                    "🔧 <b>Solution:</b> Bot admin ko <code>INSTAGRAM_COOKIES</code> environment variable set karna hoga "
+                    "apne Instagram session cookies ke saath.\n\n"
+                    "💡 <i>Public Reels abhi bhi kaam kar sakti hain — dobara try karein!</i>"
+                )
+            else:
+                err_text = (
+                    "❌ <b>Instagram media download nahi ho paya!</b>\n\n"
+                    f"⚠️ <b>Karan:</b> <code>{clean_err}</code>\n\n"
+                    "💡 <b>Tips:</b>\n"
+                    "• Check karein ki post <b>public</b> hai\n"
+                    "• Dobara try karein, thodi der mein kaam kar sakta hai"
+                )
             if status_msg_id:
                 await edit_message(client, chat_id, status_msg_id, err_text)
             else:
@@ -604,7 +821,16 @@ async def process_instagram_download(chat_id: int, video_url: str):
 
         except Exception as e:
             logger.error(f"Unexpected error in process_instagram_download: {e}", exc_info=True)
-            err_text = f"❌ <b>Kuch gadbad ho gayi:</b> {str(e)[:150]}"
+            err_str = str(e)
+            if 'INSTAGRAM_COOKIES' in err_str or 'login' in err_str.lower():
+                err_text = (
+                    "❌ <b>Instagram download fail ho gaya!</b>\n\n"
+                    "⚠️ Instagram ab bina login ke media serve nahi karta (server IPs ke liye).\n\n"
+                    "🔧 <b>Fix:</b> Bot admin ko Render/server par <code>INSTAGRAM_COOKIES</code> env variable set karna hoga.\n\n"
+                    "💡 <i>Kuch public Reels bina cookies ke bhi kaam kar sakti hain — dobara try karein!</i>"
+                )
+            else:
+                err_text = f"❌ <b>Kuch gadbad ho gayi:</b> {err_str[:150]}"
             if status_msg_id:
                 await edit_message(client, chat_id, status_msg_id, err_text)
             else:
